@@ -8,6 +8,7 @@ def pd_controller(kp, kd, q, qdes, qvel):
 #Downloading model
 model = mujoco.MjModel.from_xml_path("/Users/daeron/robust-mpc-mujoco/models/universal_robots_ur5e/ur5e.xml")
 data = mujoco.MjData(model)
+nv = model.nv
 mujoco.mj_resetData(model, data) 
 
 #Actuators and motors
@@ -78,11 +79,14 @@ renderer = mujoco.Renderer(model, width=640, height=480)
 while data.time < duration:
     q = data.qpos.copy()
     qvel = data.qvel.copy()
+    M = np.zeros((nv, nv))
+    mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
-
-    history_q.append(q)
-    data.ctrl = pd_controller(10, 5, q, qdes, qvel) + h
+    v = pd_controller(10, 5, q, qdes, qvel)
+    tau = M @ v + h
+    data.ctrl = tau
     mujoco.mj_step(model, data)
+    history_q.append(q)
     if len(frames) < data.time * framerate:
         renderer.update_scene(data)
         pixels = renderer.render()
