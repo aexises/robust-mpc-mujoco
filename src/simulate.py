@@ -1,9 +1,66 @@
 import mujoco 
 import numpy as np
 import mediapy as media
-#from controller import pd_controller
+
 def pd_controller(kp, kd, q, qdes, qvel):
     return kp * (qdes - q) - kd * qvel
+
+def predict_step(q, dq, v, dt):
+    dq_next = dq + v * dt
+    q_next  = q + dq * dt
+    return q_next, dq_next
+
+def stage_cost(q, dq, q_des, v):
+    w_q  = 20.0   # точность
+    w_dq = 1.0    # демпфирование
+    w_v  = 0.1    # не дёргать приводы
+
+    return (
+        w_q  * np.sum((q - q_des)**2)
+        + w_dq * np.sum(dq**2)
+        + w_v  * np.sum(v**2)
+    )
+
+def rollout_cost(q0, dq0, v_seq, q_des, dt):
+    q = q0.copy()
+    dq = dq0.copy()
+    cost = 0.0
+
+    for v in v_seq:
+        q, dq = predict_step(q, dq, v, dt)
+        cost += stage_cost(q, dq, q_des, v)
+
+    return cost
+
+def mpc_step(q, dq, q_des, dt):
+    N = 5
+    v_candidates = [-5.0, 0.0, 5.0]
+
+    best_cost = np.inf
+    best_v0 = np.zeros_like(q)
+
+    for v0 in v_candidates:
+        for v1 in v_candidates:
+            for v2 in v_candidates:
+                for v3 in v_candidates:
+                    for v4 in v_candidates:
+
+                        v_seq = [
+                            v0 * np.ones_like(q),
+                            v1 * np.ones_like(q),
+                            v2 * np.ones_like(q),
+                            v3 * np.ones_like(q),
+                            v4 * np.ones_like(q),
+                        ]
+
+                        cost = rollout_cost(q, dq, v_seq, q_des, dt)
+
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_v0 = v_seq[0]
+
+    return best_v0
+
 
 #Downloading model
 model = mujoco.MjModel.from_xml_path("/Users/daeron/robust-mpc-mujoco/models/universal_robots_ur5e/ur5e.xml")
@@ -69,12 +126,14 @@ for actuator_id in range(model.nu):
 data.qpos = np.array([0, 0, 0, 0, 0, 0])
 qdes = np.array([-1,-0.8,2,2,2.7,10.7])
 
-duration = 3
+duration = 10
 framerate = 60
 
 frames = []
 history_q = []
 renderer = mujoco.Renderer(model, width=640, height=480)
+
+dt = model.opt.timestep
 
 while data.time < duration:
     q = data.qpos.copy()
@@ -82,7 +141,8 @@ while data.time < duration:
     M = np.zeros((nv, nv))
     mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
-    v = pd_controller(10, 5, q, qdes, qvel)
+    #now applying MPC
+    v = mpc_step(q, qvel, qdes, dt)
     tau = M @ v + h
     data.ctrl = tau
     mujoco.mj_step(model, data)
