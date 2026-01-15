@@ -32,35 +32,37 @@ def rollout_cost(q0, dq0, v_seq, q_des, dt):
 
     return cost
 
-def mpc_step(q, dq, q_des, dt):
-    N = 5
+def mpc_step_1d(q, dq, q_des, dt):
+    N = 1000
     v_candidates = [-5.0, 0.0, 5.0]
 
     best_cost = np.inf
-    best_v0 = np.zeros_like(q)
+    best_v0 = 0.0
 
     for v0 in v_candidates:
         for v1 in v_candidates:
             for v2 in v_candidates:
-                for v3 in v_candidates:
-                    for v4 in v_candidates:
 
-                        v_seq = [
-                            v0 * np.ones_like(q),
-                            v1 * np.ones_like(q),
-                            v2 * np.ones_like(q),
-                            v3 * np.ones_like(q),
-                            v4 * np.ones_like(q),
-                        ]
+                v_seq = [v0, v1, v2]
 
-                        cost = rollout_cost(q, dq, v_seq, q_des, dt)
+                q_pred = q
+                dq_pred = dq
+                cost = 0.0
 
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_v0 = v_seq[0]
+                for v in v_seq:
+                    dq_pred = dq_pred + v * dt
+                    q_pred = q_pred + dq_pred * dt
+                    cost += (
+                        20.0 * (q_pred - q_des)**2
+                        + 1.0 * dq_pred**2
+                        + 0.1 * v**2
+                    )
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_v0 = v0
 
     return best_v0
-
 
 #Downloading model
 model = mujoco.MjModel.from_xml_path("/Users/daeron/robust-mpc-mujoco/models/universal_robots_ur5e/ur5e.xml")
@@ -126,13 +128,13 @@ for actuator_id in range(model.nu):
 data.qpos = np.array([0, 0, 0, 0, 0, 0])
 qdes = np.array([-1,-0.8,2,2,2.7,10.7])
 
-duration = 10
+duration = 5
 framerate = 60
 
 frames = []
 history_q = []
 renderer = mujoco.Renderer(model, width=640, height=480)
-
+mpc_joint = 0
 dt = model.opt.timestep
 
 while data.time < duration:
@@ -142,7 +144,9 @@ while data.time < duration:
     mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
     #now applying MPC
-    v = mpc_step(q, qvel, qdes, dt)
+    v = np.zeros(nv)
+    v_mpc = mpc_step_1d(q[mpc_joint], qvel[mpc_joint], qdes[mpc_joint], dt)
+    v[mpc_joint] = v_mpc
     tau = M @ v + h
     data.ctrl = tau
     mujoco.mj_step(model, data)
@@ -152,4 +156,4 @@ while data.time < duration:
         pixels = renderer.render()
         frames.append(pixels)
 media.write_video('simulation.mp4', frames, fps=framerate)
-print("Видео сохранено в simulation.mp4")
+print("Video saved as simulation.mp4")
