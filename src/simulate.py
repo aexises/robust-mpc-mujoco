@@ -2,73 +2,54 @@ import mujoco
 import numpy as np
 import mediapy as media
 
-def pd_controller(kp, kd, q, qdes, qvel):
-    return kp * (qdes - q) - kd * qvel
-
-def predict_step(q, dq, v, dt):
-    dq_next = dq + v * dt
-    q_next  = q + dq * dt
-    return q_next, dq_next
-
-def stage_cost(q, dq, q_des, v):
-    w_q  = 20.0   # точность
-    w_dq = 1.0    # демпфирование
-    w_v  = 0.1    # не дёргать приводы
-
-    return (
-        w_q  * np.sum((q - q_des)**2)
-        + w_dq * np.sum(dq**2)
-        + w_v  * np.sum(v**2)
-    )
-
-def rollout_cost(q0, dq0, v_seq, q_des, dt):
-    q = q0.copy()
-    dq = dq0.copy()
-    cost = 0.0
-
-    for v in v_seq:
-        q, dq = predict_step(q, dq, v, dt)
-        cost += stage_cost(q, dq, q_des, v)
-
-    return cost
-
-def mpc_step_1d(q, dq, q_des, dt):
-    N = 1000
-    v_candidates = [-5.0, 0.0, 5.0]
-
-    best_cost = np.inf
-    best_v0 = 0.0
-
-    for v0 in v_candidates:
-        for v1 in v_candidates:
-            for v2 in v_candidates:
-
-                v_seq = [v0, v1, v2]
-
-                q_pred = q
-                dq_pred = dq
-                cost = 0.0
-
-                for v in v_seq:
-                    dq_pred = dq_pred + v * dt
-                    q_pred = q_pred + dq_pred * dt
-                    cost += (
-                        20.0 * (q_pred - q_des)**2
-                        + 1.0 * dq_pred**2
-                        + 0.1 * v**2
-                    )
-
-                if cost < best_cost:
-                    best_cost = cost
-                    best_v0 = v0
-
-    return best_v0
-
 #Downloading model
 model = mujoco.MjModel.from_xml_path("/Users/daeron/robust-mpc-mujoco/models/universal_robots_ur5e/ur5e.xml")
 data = mujoco.MjData(model)
 nv = model.nv
 mujoco.mj_resetData(model, data) 
+
+
+
+dt = model.opt.timestep
+n = model.nv  # 6
+
+A = np.block([
+    [np.eye(n), dt * np.eye(n)],
+    [np.zeros((n, n)), np.eye(n)]
+])
+
+B = np.block([
+    [0.5 * dt**2 * np.eye(n)],
+    [dt * np.eye(n)]
+])
+
+def build_prediction_matrices(A, B, N):
+    nx = A.shape[0]
+    nu = B.shape[1]
+
+    A_bar = np.zeros((nx*N, nx))
+    B_bar = np.zeros((nx*N, nu*N))
+
+    for i in range(N):
+        A_bar[i*nx:(i+1)*nx] = np.linalg.matrix_power(A, i+1)
+
+        for j in range(i+1):
+            B_bar[i*nx:(i+1)*nx, j*nu:(j+1)*nu] = \
+                np.linalg.matrix_power(A, i-j) @ B
+
+    return A_bar, B_bar
+
+Q = np.diag(
+    np.concatenate([
+        50.0 * np.ones(n),   # позиция
+        5.0  * np.ones(n)    # скорость
+    ])
+)
+
+R = 0.01 * np.eye(n)
+Qf = 200.0 * Q
+
+
 
 #Actuators and motors
 
@@ -144,10 +125,19 @@ while data.time < duration:
     mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
     #now applying MPC
-    v = np.zeros(nv)
-    v_mpc = mpc_step_1d(q[mpc_joint], qvel[mpc_joint], qdes[mpc_joint], dt)
-    v[mpc_joint] = v_mpc
-    tau = M @ v + h
+    N = 3
+    x0 = np.concatenate([q, qvel])
+    x_ref_single = np.concatenate([qdes, np.zeros(n)])
+    x_ref = np.tile(x_ref_single, N)
+    A_bar, B_bar = build_prediction_matrices(A, B, N)
+    Q_bar = np.kron(np.eye(N), Q)
+    Q_bar[-Q.shape[0]:, -Q.shape[1]:] = Qf
+    R_bar = np.kron(np.eye(N), R)
+    H = B_bar.T @ Q_bar @ B_bar + R_bar
+    f = B_bar.T @ Q_bar @ (A_bar @ x0 - x_ref)
+    U = -np.linalg.solve(H, f)
+    u0 = U[:n]
+    tau = M @ u0 + h
     data.ctrl = tau
     mujoco.mj_step(model, data)
     history_q.append(q)
