@@ -125,7 +125,7 @@ while data.time < duration:
     mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
     #now applying MPC
-    N = 3
+    N = 20
     x0 = np.concatenate([q, qvel])
     x_ref_single = np.concatenate([qdes, np.zeros(n)])
     x_ref = np.tile(x_ref_single, N)
@@ -139,11 +139,14 @@ while data.time < duration:
     u0 = U[:n]
     tau = M @ u0 + h
     data.ctrl = tau
+    #adding disturbance
+    disturbance = np.random.uniform(-1.0, 1.0, size=nv)
+    data.qfrc_applied[:] += disturbance
     mujoco.mj_step(model, data)
     history_q.append(q)
     if len(frames) < data.time * framerate:
         renderer.update_scene(data)
         pixels = renderer.render()
         frames.append(pixels)
-media.write_video('simulation.mp4', frames, fps=framerate)
+media.write_video('simulationDIST.mp4', frames, fps=framerate)
 print("Video saved as simulation.mp4")
