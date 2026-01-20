@@ -1,14 +1,14 @@
 import mujoco 
 import numpy as np
 import mediapy as media
+import scipy.linalg as la
+import cvxpy as cp
 
 #Downloading model
 model = mujoco.MjModel.from_xml_path("/Users/daeron/robust-mpc-mujoco/models/universal_robots_ur5e/ur5e.xml")
 data = mujoco.MjData(model)
 nv = model.nv
 mujoco.mj_resetData(model, data) 
-
-
 
 dt = model.opt.timestep
 n = model.nv  # 6
@@ -22,6 +22,7 @@ B = np.block([
     [0.5 * dt**2 * np.eye(n)],
     [dt * np.eye(n)]
 ])
+
 
 def build_prediction_matrices(A, B, N):
     nx = A.shape[0]
@@ -49,10 +50,55 @@ Q = np.diag(
 R = 0.01 * np.eye(n)
 Qf = 200.0 * Q
 
+def compute_lqr_gain(A, B, Q, R):
+    P = la.solve_discrete_are(A, B, Q, R)
+    K = -np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+    return K 
 
+K = compute_lqr_gain(A, B, Q, R)
+A_cl = A + B @ K
+
+def compute_rpi_bounds(A_cl, W_max, tol = 1e-4, max_iter = 1000):
+    rho = max(abs(np.linalg.eigvals(A_cl)))
+    if rho > 1:
+        raise ValueError("A_cl is not stable")
+    
+    # Iterative sum for box (using inf-norm)
+    Omega = np.zeros((2*n,))  # Start with zero set
+    Ak = np.eye(2*n)  # A_cl^0
+    for k in range(max_iter):
+        add_set = np.linalg.norm(Ak, ord=np.inf, axis=1) * W_max  # Propagate W bound
+        new_Omega = Omega + add_set
+        if np.all(np.abs(new_Omega - Omega) < tol):
+            break
+        Omega = new_Omega
+        Ak = Ak @ A_cl
+    bounds = Omega  # Symmetric, so [-bounds, bounds]
+    return bounds  # Shape (12,), radius per state
+
+def solve_constrained_mpc(A_bar, B_bar, H, f, x0, x_ref, x_min_tight, x_max_tight, u_min, u_max, N, n, nx):
+    nu = n  # inputs per step
+    U = cp.Variable(N * nu)  # optimization var
+    cost = 0.5 * cp.quad_form(U, H) + f.T @ U
+    X_pred = A_bar @ x0 + B_bar @ U
+    
+    constraints = [
+        X_pred >= x_min_tight,  # State lower
+        X_pred <= x_max_tight,  # State upper
+        U >= np.tile(u_min, N), 
+        U <= np.tile(u_max, N)
+    ]
+    
+    prob = cp.Problem(cp.Minimize(cost), constraints)
+    prob.solve(solver=cp.OSQP)  # Or ECOS if issues
+    
+    if prob.status != cp.OPTIMAL:
+        print("QP infeasible!")  # Fallback: use unconstrained or zero u
+        return np.zeros(N * nu)  # Or last U
+    
+    return U.value
 
 #Actuators and motors
-
 class ActuatorMotor:
     def __init__(self, torque_range = [-100,100]) -> None:
         self.range = torque_range
@@ -98,12 +144,30 @@ def update_actuator(model, actuator_id, actuator):
     model.actuator(actuator_id).gainprm[:3] = actuator.gain
     model.actuator(actuator_id).biasprm[:3] = actuator.bias
 
-
 # update actuators
 position_motor = ActuatorMotor()
 
 for actuator_id in range(model.nu):
     update_actuator(model, actuator_id, position_motor)
+
+# Position bounds 
+q_min = model.jnt_range[:, 0].copy()  # Lower joint limits
+q_max = model.jnt_range[:, 1].copy()  # Upper
+
+# Velocity bounds 
+v_min = -10.0 * np.ones(n)  # rad/s
+v_max = 10.0 * np.ones(n)
+
+# State bounds
+x_min = np.concatenate([q_min, v_min])
+x_max = np.concatenate([q_max, v_max])
+
+# Input bounds (u as accel)
+u_min = -100.0 * np.ones(n)
+u_max = 100.0 * np.ones(n)
+
+# Tube bounds
+tube_bounds = compute_rpi_bounds(A_cl, W_max = 0.1)
 
 #Simulation
 data.qpos = np.array([0, 0, 0, 0, 0, 0])
@@ -125,7 +189,7 @@ while data.time < duration:
     mujoco.mj_fullM(model, M, data.qM)
     h = data.qfrc_bias.copy()
     #now applying MPC
-    N = 20
+    N = 10
     x0 = np.concatenate([q, qvel])
     x_ref_single = np.concatenate([qdes, np.zeros(n)])
     x_ref = np.tile(x_ref_single, N)
@@ -135,7 +199,9 @@ while data.time < duration:
     R_bar = np.kron(np.eye(N), R)
     H = B_bar.T @ Q_bar @ B_bar + R_bar
     f = B_bar.T @ Q_bar @ (A_bar @ x0 - x_ref)
-    U = -np.linalg.solve(H, f)
+    x_min_tight = np.tile(x_min + tube_bounds, N)
+    x_max_tight = np.tile(x_max - tube_bounds, N)
+    U = solve_constrained_mpc(A_bar, B_bar, H, f, x0, x_ref, x_min_tight, x_max_tight, u_min, u_max, N, n, 2*n)
     u0 = U[:n]
     tau = M @ u0 + h
     data.ctrl = tau
