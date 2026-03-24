@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+.venv/
+env/
+
+artifacts/
+controls.png
+errors.png
+infeas.png
+positions.png
+simulation*.mp4
+results/*.mp4
